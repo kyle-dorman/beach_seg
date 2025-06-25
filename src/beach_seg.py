@@ -23,7 +23,7 @@ from tqdm import tqdm
 from transformers import SegGptForImageSegmentation, SegGptImageProcessor
 
 from src.multichannel_img import broad_band
-from src.util import save_tif
+from src.geo_util import save_tif
 
 SEED = 42
 py_random.seed(SEED)
