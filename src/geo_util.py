@@ -1,16 +1,20 @@
 import logging
 import math
 from pathlib import Path
+from typing import Any
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
 from affine import Affine
+from matplotlib import colors
 from PIL import Image, ImageDraw
 from rasterio.enums import Resampling
 from rasterio.features import rasterize
-from rasterio.windows import Window, from_bounds
+from rasterio.warp import reproject
+from rasterio.windows import Window
+from matplotlib.patches import Rectangle as mRectangle
 from shapely.geometry import LineString, MultiLineString, Polygon
 from shapely.ops import linemerge
 from skimage import exposure, measure
@@ -18,32 +22,6 @@ from skimage import exposure, measure
 from src.multichannel_img import broad_band
 
 local_logger = logging.getLogger(__name__)
-
-
-def polygon_to_mask(image_size: tuple[int, int], polygon: Polygon) -> np.ndarray:
-    """
-    Convert a shapely polygon to a binary mask (numpy array).
-
-    Args:
-        image_size (tuple): Size of the output mask (width, height).
-        polygon (shapely.geometry.Polygon): The Shapely polygon to be drawn.
-
-    Returns:
-        numpy.ndarray: Binary mask with 1 inside the polygon and 0 outside.
-    """
-    # Create a blank image (black background)
-    img = Image.new("L", image_size, 0)  # 'L' mode is for grayscale (8-bit pixels)
-
-    # Convert the polygon coordinates to a format that ImageDraw can use
-    polygon_coords = [(x, y) for x, y in polygon.exterior.coords]
-
-    # Draw the polygon on the image (255 for white)
-    ImageDraw.Draw(img).polygon(polygon_coords, outline=1, fill=1)
-
-    # Convert the image to a numpy array
-    mask = np.array(img)
-
-    return mask
 
 
 def tif_paths(directory: Path) -> list[Path]:
@@ -195,7 +173,8 @@ def compute_raster_extent(
     # Initialize from first file
     with rasterio.open(tif_paths[0]) as src0:
         left, bottom, right, top = src0.bounds
-        tx, ty = src0.transform.a, -src0.transform.e
+        trans0 = src0.transform
+        tx, ty = trans0.a, -trans0.e
         base_crs = src0.crs
     # Accumulate bounds
     for tif in tif_paths[1:]:
@@ -207,6 +186,9 @@ def compute_raster_extent(
             bottom = min(bottom, b.bottom)
             right = max(right, b.right)
             top = max(top, b.top)
+            trans = src.transform
+            assert trans.a == tx and trans.e == -ty
+
     # Compute shape
     width = int(math.ceil((right - left) / tx))
     height = int(math.ceil((top - bottom) / ty))
@@ -239,7 +221,11 @@ def group_images_by_date(img_paths: list[Path]) -> dict[str, list[Path]]:
 def rasterize_gdf(gdf: gpd.GeoDataFrame, out_shape: tuple[int, int], out_transform: Affine):
     # Rasterize into a binary mask
     return rasterize(
-        [(geom, 1) for geom in gdf.geometry], out_shape=out_shape, transform=out_transform, fill=0, dtype="uint8"
+        shapes=[(geom, 1) for geom in gdf.geometry],
+        out_shape=out_shape,
+        transform=out_transform,
+        fill=0,
+        dtype="uint8",
     )
 
 
@@ -254,13 +240,13 @@ def merged_no_data_mask(water_mask: np.ndarray, veg_mask: np.ndarray) -> np.ndar
 
         elif not len(water_row):
             veg_start = veg_row[0]
-            veg_end = veg_row[-1]
+            veg_end = veg_row[-1] + 1
 
             line_no_data[row, :veg_start] = True
             line_no_data[row, veg_end:] = True
         elif not len(veg_row):
             water_start = water_row[0]
-            water_end = water_row[-1]
+            water_end = water_row[-1] + 1
 
             line_no_data[row, :water_start] = True
             line_no_data[row, water_end:] = True
@@ -271,71 +257,58 @@ def merged_no_data_mask(water_mask: np.ndarray, veg_mask: np.ndarray) -> np.ndar
             veg_end = veg_row[-1]
 
             # veg to right of water
-            if veg_start > water_end:
+            if veg_start >= water_end:
                 line_no_data[row, :water_start] = True
-                line_no_data[row, veg_end:] = True
-            elif veg_start < water_end:
+                line_no_data[row, veg_end + 1:] = True
+            elif veg_start <= water_end:
                 # veg to left of water
                 line_no_data[row, :veg_start] = True
-                line_no_data[row, water_end:] = True
+                line_no_data[row, water_end + 1:] = True
 
     return line_no_data
 
 
 def create_per_day_crops(
     crops: list[tuple[int, int, int, int]],
-    out_transform: Affine,
-    tif_paths: list[Path],
-    mask_array: np.ndarray,
+    img: np.ndarray,
+    nodata: np.ndarray,
+    label: np.ndarray,
     crop_size: int,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray]:
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
     """
     Generate image, nodata crops and mask crops from a reference TIFF and its mask array.
     """
     prompt_imgs = [np.zeros((crop_size, crop_size, 3), dtype=np.uint8) for _ in range(len(crops))]
-    prompt_masks = [np.zeros((crop_size, crop_size), dtype=np.uint8) for _ in range(len(crops))]
+    prompt_labels = [np.zeros((crop_size, crop_size), dtype=np.uint8) for _ in range(len(crops))]
     prompt_nodata_masks = [np.ones((crop_size, crop_size), dtype=np.uint8) for _ in range(len(crops))]
-    full_size_yes_data = np.zeros_like(mask_array, dtype=np.bool_)
 
     for c_idx, (xmin, ymin, xmax, ymax) in enumerate(crops):
-        for tif_path in tif_paths:
-            with rasterio.open(tif_path) as src:
-                ul_x, ul_y = out_transform * (xmin, ymin)  # type: ignore
-                lr_x, lr_y = out_transform * (xmax, ymax)  # type: ignore
+        prompt_imgs[c_idx] = padded_crop(img, xmin, ymin, xmax, ymax, crop_size)
+        prompt_labels[c_idx] = padded_crop(label, xmin, ymin, xmax, ymax, crop_size)
+        prompt_nodata_masks[c_idx] = padded_crop(nodata, xmin, ymin, xmax, ymax, crop_size, value=1)
 
-                win = from_bounds(left=ul_x, top=ul_y, right=lr_x, bottom=lr_y, transform=src.transform)
-                img_crop, nodata = crop_with_mask(tif_path, win, crop_size)
-
-                if np.all(nodata):
-                    continue
-
-                safe_assign_crop(full_size_yes_data, ~nodata, ymin, ymax, xmin, xmax, logic="or")
-
-                update_mask = prompt_nodata_masks[c_idx] & ~nodata
-                for i in range(3):
-                    channel_update = np.where(update_mask, img_crop[:, :, i], prompt_imgs[c_idx][:, :, i])
-                    prompt_imgs[c_idx][:, :, i] = channel_update
-                prompt_nodata_masks[c_idx] = np.where(update_mask, 0, prompt_nodata_masks[c_idx])
-
-        mask_crop = padded_mask_crop(mask_array, xmin, ymin, xmax, ymax, crop_size)
-        prompt_masks[c_idx] = mask_crop
-
-    return prompt_imgs, prompt_masks, prompt_nodata_masks, ~full_size_yes_data
+    return prompt_imgs, prompt_labels, prompt_nodata_masks
 
 
-def padded_mask_crop(
-    mask_array: np.ndarray,
+def padded_crop(
+    arr: np.ndarray,
     xmin: int,
     ymin: int,
     xmax: int,
     ymax: int,
     crop_size: int,
+    value: int = 0
 ) -> np.ndarray:
     """
     Extract a crop from mask_array with zero padding for out-of-bounds areas.
     """
-    padded = np.zeros((crop_size, crop_size), dtype=mask_array.dtype)
-    h, w = mask_array.shape
+    if len(arr.shape) == 3:
+        h, w, c = arr.shape
+        padded = np.full((crop_size, crop_size, c), fill_value=value, dtype=arr.dtype)
+    else:
+        h, w = arr.shape
+        padded = np.full((crop_size, crop_size), fill_value=value, dtype=arr.dtype)
+    
     x0 = max(xmin, 0)
     x1 = min(xmax, w)
     y0 = max(ymin, 0)
@@ -345,7 +318,7 @@ def padded_mask_crop(
     yend = y1 - ymin
     xstart = x0 - xmin
     xend = x1 - xmin
-    padded[ystart:yend, xstart:xend] = mask_array[y0:y1, x0:x1]
+    padded[ystart:yend, xstart:xend] = arr[y0:y1, x0:x1]
     return padded
 
 
@@ -379,6 +352,123 @@ def safe_assign_crop(
         output[dy0:dy1, dx0:dx1][to_update] = crop[sy0:sy1, sx0:sx1][to_update]
 
 
+def merge_tifs(
+    ref_imgs: list[Path], out_shape: tuple[int, int], out_transform: Any, crs: str
+) -> tuple[np.ndarray, np.ndarray]:
+    with rasterio.open(ref_imgs[0]) as src:
+        C = src.count
+    dst_data = np.empty((len(ref_imgs), C, *out_shape), dtype=np.float32)
+    dst_yesdata = np.ones((len(ref_imgs), *out_shape), dtype=np.uint8)
+
+    for idx, img_path in enumerate(ref_imgs):
+        with rasterio.open(img_path) as src:
+            assert src.count == C
+            src_data = src.read(list(range(1, src.count + 1)), out_dtype=np.float32)
+            src_transform = src.transform
+            src_crs = src.crs
+            yesdata = (src.read_masks(1)).astype(np.uint8)
+
+            reproject(
+                source=src_data,
+                destination=dst_data[idx],
+                src_transform=src_transform,
+                src_crs=src_crs,
+                dst_transform=out_transform,
+                dst_crs=crs,
+                resampling=Resampling.bilinear,
+            )
+            reproject(
+                source=yesdata,
+                destination=dst_yesdata[idx],
+                src_transform=src_transform,
+                src_crs=src_crs,
+                dst_transform=out_transform,
+                dst_crs=crs,
+                resampling=Resampling.nearest,
+                fill=0,
+            )
+
+    # imgs: (N, C, H, W)
+    # mask: (N, H, W)   binary or general weights
+    mask_f = dst_yesdata.astype(dst_data.dtype)  # promote to same dtype
+    w = mask_f[:, None, :, :]  # (N,1,H,W)  broadcast to C channels
+    weighted_sum = (dst_data * w).sum(axis=0)  # (C, H, W)
+    weights = w.sum(axis=0)  # (H, W)
+    # avoid divide-by-zero; where weights==0 you’ll get NaN
+    mean = np.divide(weighted_sum, weights, out=np.full_like(weighted_sum, 0.0), where=weights != 0)
+
+    mask = ~np.any(dst_yesdata, axis=0)
+    img = tif_image(mean, mask)
+
+    return img, mask
+
+
+def plot_line(line, color, ax, linewidth=0.5):
+    if line.geom_type == "LineString":
+        xs, ys = line.xy
+        ax.plot(xs, ys, color=color, linewidth=linewidth)
+    elif line.geom_type == "MultiLineString":
+        for line in line.geoms:
+            xs, ys = line.xy
+            ax.plot(xs, ys, color=color, linewidth=linewidth)
+
+
+def plot_mask(mask, color, alpha, ax):
+    color = np.array(color_to_rgba(color, alpha))
+    h, w = mask.shape
+    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    ax.imshow(mask_image)
+    
+    
+def plot_crops(crops, color, ax):
+    for crop in crops:
+        x1, y1, x2, y2 = crop
+        side = max(x2 - x1, y2 - y1)  
+        ax.add_patch(
+            mRectangle(
+                (x1, y1),
+                side, side,
+                linewidth=1,
+                edgecolor=color,
+                facecolor="none",
+                fill=False
+            )
+        )
+
+
+def tif_image(data, nodata):
+    C = len(data)
+    if C == 8:
+        img = broad_band(data, nodata)
+    else:
+        img = np.log10(1 + data[[3, 2, 1]])
+        for i in range(3):
+            img[i] -= img[i][~nodata].min()
+            img[i] /= img[i][~nodata].max()
+            img[i][nodata] = 0
+        img = img.transpose((1, 2, 0)).copy()
+
+    img = np.array(exposure.equalize_adapthist(img) * 255, dtype=np.uint8)
+    return img
+
+
+def color_to_rgba(color: str, alpha: float = 1.0) -> tuple:
+    """
+    Convert a color string to an (R, G, B, A) tuple.
+
+    Args:
+        color (str): Color name, hex code, or rgb() string.
+        alpha (float): Alpha value between 0.0 and 1.0.
+
+    Returns:
+        tuple: (R, G, B, A) with each value between 0 and 255.
+    """
+    rgb = colors.to_rgb(color)  # returns (r, g, b) between 0 and 1
+    rgba = tuple(int(255 * c) for c in rgb) + (int(255 * alpha),)
+    return rgba
+
+
+# ----------------------
 def crop_with_mask(pth: Path, win: Window, crop_size: int) -> tuple[np.ndarray, np.ndarray]:
     with rasterio.open(pth) as src:
         if src.count == 8:
@@ -435,3 +525,29 @@ def crop_with_mask(pth: Path, win: Window, crop_size: int) -> tuple[np.ndarray, 
 
     img = np.array(exposure.equalize_adapthist(img) * 255, dtype=np.uint8)
     return img, mask
+
+
+def polygon_to_mask(image_size: tuple[int, int], polygon: Polygon) -> np.ndarray:
+    """
+    Convert a shapely polygon to a binary mask (numpy array).
+
+    Args:
+        image_size (tuple): Size of the output mask (width, height).
+        polygon (shapely.geometry.Polygon): The Shapely polygon to be drawn.
+
+    Returns:
+        numpy.ndarray: Binary mask with 1 inside the polygon and 0 outside.
+    """
+    # Create a blank image (black background)
+    img = Image.new("L", image_size, 0)  # 'L' mode is for grayscale (8-bit pixels)
+
+    # Convert the polygon coordinates to a format that ImageDraw can use
+    polygon_coords = [(x, y) for x, y in polygon.exterior.coords]
+
+    # Draw the polygon on the image (255 for white)
+    ImageDraw.Draw(img).polygon(polygon_coords, outline=1, fill=1)
+
+    # Convert the image to a numpy array
+    mask = np.array(img)
+
+    return mask

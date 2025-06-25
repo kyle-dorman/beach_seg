@@ -25,11 +25,11 @@ from src.geo_util import (
     group_images_by_date,
     infer_date,
     load_and_merge_masks,
+    merge_tifs,
     merged_no_data_mask,
     rasterize_gdf,
 )
 from src.ml_util import generate_square_crops_along_line, load_model
-
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -214,6 +214,7 @@ def main(base_dir, crop_size, epochs, lr, n_prompts, prompt_dropout, out_ckpt):
     img_paths = list((base_path / "SatelliteImagery").glob("*/*.tif"))
     groups = group_images_by_date(img_paths)
     ref_imgs = groups.pop(mask_date, [])  # reference date imagery only
+    assert len(ref_imgs)
 
     out_transform, out_shape, crs = compute_raster_extent(ref_imgs)
     veg_gdf = load_and_merge_masks(veg_masks)
@@ -221,15 +222,21 @@ def main(base_dir, crop_size, epochs, lr, n_prompts, prompt_dropout, out_ckpt):
     water_gdf = load_and_merge_masks(water_masks)
     water_mask = rasterize_gdf(water_gdf, out_shape, out_transform) == 1
     full_no_data = merged_no_data_mask(water_mask, veg_mask)
-    merged_mask = veg_mask.astype("uint8") * 2 + water_mask.astype("uint8")  # 0,1,2
+    sand_mask = ~(full_no_data | water_mask | veg_mask)
+    merged_mask = np.zeros((*veg_mask.shape, 3), dtype=np.uint8)
+    merged_mask[water_mask] = 1
+    merged_mask[veg_mask] = 2
+    merged_mask[sand_mask] = 3
 
     # ── Build crops along water line ─────────────────────────────────────────
     water_line = extract_linestring(water_mask, full_no_data)
     assert water_line is not None
     prompt_crops = generate_square_crops_along_line(water_line, crop_size, 0)
+    
+    full_prompt_img, full_prompt_no_data = merge_tifs(ref_imgs, out_shape, out_transform, crs)
 
-    p_imgs, p_masks, p_nodata, _ = create_per_day_crops(prompt_crops, out_transform, ref_imgs, merged_mask, crop_size)
-    keep = [i for i, nd in enumerate(p_nodata) if (~nd).any()]
+    p_imgs, p_masks, p_nodata = create_per_day_crops(prompt_crops, full_prompt_img, full_prompt_no_data, merged_mask, crop_size)
+    keep = [i for i, nd in enumerate(p_nodata) if ~np.all(nd)]
     p_imgs = [p_imgs[i] for i in keep]
     p_masks = [p_masks[i] for i in keep]
     p_nodata = [p_nodata[i] for i in keep]

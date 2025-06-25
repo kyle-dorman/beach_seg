@@ -1,4 +1,4 @@
 #!/bin/bash
 
-jupyter notebook --notebook-dir=notebooks --port=8893
+jupyter lab --notebook-dir=notebooks --port=8894
 

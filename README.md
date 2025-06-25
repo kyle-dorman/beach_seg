@@ -73,7 +73,7 @@ You can inspect the results using an included jupyter notebook.
 
 Launch jupyter notebook
 ```bash
-jupyter notebook --notebook-dir=notebooks --port=8893
+jupyter lab --notebook-dir=notebooks --port=8894
 ```
 Run the notebook `beach_seg.ipynb` 
 
