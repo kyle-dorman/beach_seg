@@ -55,5 +55,3 @@ def masked_contrast_stretch(image: np.ndarray, mask: np.ndarray, p_low: int | No
 def write_1bit_png(filename: Path, img: np.ndarray) -> None:
     i = Image.fromarray(img).convert(mode="1", dither=Image.Dither.NONE)
     i.save(filename, optimize=True)
-
-
