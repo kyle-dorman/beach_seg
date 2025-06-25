@@ -1,0 +1,24 @@
+{
+    "recommendations": [
+       "ms-python.vscode-pylance",
+       "ms-python.python",
+       "donjayamanne.python-extension-pack",
+       "donjayamanne.python-environment-manager",
+       "kevinrose.vsc-python-indent",
+       "njpwerner.autodocstring",
+       "visualstudioexptteam.vscodeintellicode",
+       "ms-azuretools.vscode-docker",
+       "mechatroner.rainbow-csv",
+       "ms-vscode.makefile-tools",
+       "GeriYoco.vscode-image-gallery",
+       "batisteo.vscode-django",
+       "ms-python.flake8",
+       "ms-toolsai.jupyter",
+       "ms-toolsai.jupyter-keymap",
+       "ms-toolsai.jupyter-renderers",
+       "ms-toolsai.tensorboard",
+       "ms-toolsai.vscode-jupyter-cell-tags",
+       "ms-toolsai.vscode-jupyter-slideshow",
+       "wholroyd.jinja",
+    ]
+}

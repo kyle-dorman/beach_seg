@@ -1,0 +1,57 @@
+name: beach_seg
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  # Python
+  - python>=3.11.9
+  # basic Python build tools
+  - pip
+  - setuptools
+  - wheel
+  # Base
+  - PyYAML
+  - tqdm
+  - click
+  - python-dotenv
+  - numpy
+  - pandas
+  - affine
+  # ML
+  - tensorboard>=2.4.1
+  - opencv>=4.8.0
+  - Pillow>=10.0.0
+  - scipy>=1.4.1
+  - scikit-learn
+  - scikit-image
+  - pytorch-cpu>=2.7
+  - torchvision>=0.19.0
+  - torchmetrics
+  - transformers
+  - lightning>=2.4.0
+  # Geo
+  - rasterio 
+  - shapely 
+  - folium 
+  # Upgrade geopandas and fiona together
+  # https://stackoverflow.com/questions/78949093/how-to-resolve-attributeerror-module-fiona-has-no-attribute-path
+  - geopandas>=0.14.4
+  - fiona>=1.10.0
+  # Plotting
+  - seaborn
+  - matplotlib
+  # Notebooks
+  - ipython
+  - notebook
+  - ipywidgets
+  - widgetsnbextension
+  # Linting
+  - black
+  - isort
+  - pyupgrade
+  - pygments
+  - flake8
+  - autopep8
+  - nptyping
+  - pip:
+      - -e .

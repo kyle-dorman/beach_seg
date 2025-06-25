@@ -1,0 +1,31 @@
+[tool.black]
+line-length = 120
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 120
+
+[tool.pyright]
+include = ["."]
+
+typeCheckingMode = "basic"
+useLibraryCodeForTypes = true
+pythonPlatform = "Linux"
+pythonVersion = "3.10"
+verboseOutput = true
+
+reportMissingImports = true
+reportMissingTypeStubs = false
+reportGeneralTypeIssues = "warning"
+reportPrivateImportUsage = "none"
+reportUnboundVariable = "warning"
+
+[tool.autopep8]
+max_line_length = 120
+ignore = ["W503", "W690"]
+in-place = true
+recursive = true
+experimental = true
+aggressive = 3
+verbose = false
