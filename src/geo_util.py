@@ -9,12 +9,12 @@ import pandas as pd
 import rasterio
 from affine import Affine
 from matplotlib import colors
+from matplotlib.patches import Rectangle as mRectangle
 from PIL import Image, ImageDraw
 from rasterio.enums import Resampling
 from rasterio.features import rasterize
 from rasterio.warp import reproject
 from rasterio.windows import Window
-from matplotlib.patches import Rectangle as mRectangle
 from shapely.geometry import LineString, MultiLineString, Polygon
 from shapely.ops import linemerge
 from skimage import exposure, measure
@@ -272,7 +272,7 @@ def create_per_day_crops(
     crops: list[tuple[int, int, int, int]],
     img: np.ndarray,
     nodata: np.ndarray,
-    label: np.ndarray,
+    label: np.ndarray | None,
     crop_size: int,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
     """
@@ -284,20 +284,15 @@ def create_per_day_crops(
 
     for c_idx, (xmin, ymin, xmax, ymax) in enumerate(crops):
         prompt_imgs[c_idx] = padded_crop(img, xmin, ymin, xmax, ymax, crop_size)
-        prompt_labels[c_idx] = padded_crop(label, xmin, ymin, xmax, ymax, crop_size)
         prompt_nodata_masks[c_idx] = padded_crop(nodata, xmin, ymin, xmax, ymax, crop_size, value=1)
+        if label is not None:
+            prompt_labels[c_idx] = padded_crop(label, xmin, ymin, xmax, ymax, crop_size)
 
     return prompt_imgs, prompt_labels, prompt_nodata_masks
 
 
 def padded_crop(
-    arr: np.ndarray,
-    xmin: int,
-    ymin: int,
-    xmax: int,
-    ymax: int,
-    crop_size: int,
-    value: int = 0
+    arr: np.ndarray, xmin: int, ymin: int, xmax: int, ymax: int, crop_size: int, value: int = 0
 ) -> np.ndarray:
     """
     Extract a crop from mask_array with zero padding for out-of-bounds areas.
@@ -308,7 +303,7 @@ def padded_crop(
     else:
         h, w = arr.shape
         padded = np.full((crop_size, crop_size), fill_value=value, dtype=arr.dtype)
-    
+
     x0 = max(xmin, 0)
     x1 = min(xmax, w)
     y0 = max(ymin, 0)
@@ -418,22 +413,13 @@ def plot_mask(mask, color, alpha, ax):
     h, w = mask.shape
     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
     ax.imshow(mask_image)
-    
-    
+
+
 def plot_crops(crops, color, ax):
     for crop in crops:
         x1, y1, x2, y2 = crop
-        side = max(x2 - x1, y2 - y1)  
-        ax.add_patch(
-            mRectangle(
-                (x1, y1),
-                side, side,
-                linewidth=1,
-                edgecolor=color,
-                facecolor="none",
-                fill=False
-            )
-        )
+        side = max(x2 - x1, y2 - y1)
+        ax.add_patch(mRectangle((x1, y1), side, side, linewidth=1, edgecolor=color, facecolor="none", fill=False))
 
 
 def tif_image(data, nodata):

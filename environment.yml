@@ -32,6 +32,8 @@ dependencies:
   - torchmetrics
   - transformers
   - lightning>=2.4.0
+  - omegaconf
+  - korina
   # Geo
   - rasterio 
   - shapely 

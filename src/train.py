@@ -9,14 +9,21 @@ import logging
 import random
 from collections import deque
 from pathlib import Path
+from typing import Any
 
 import click
-import numpy as np
+import kornia.augmentation as K
+import lightning.pytorch as pl  # NEW
+import numpy as np  # NEW
 import torch
+from PIL import Image
+from PIL.Image import Resampling
+from torch.utils.data import DataLoader, Dataset  # NEW
 from torchvision import transforms as T
 from tqdm import tqdm
 from transformers import SegGptForImageSegmentation, SegGptImageProcessor
 
+from src.config import BeachSegConfig
 from src.geo_util import (
     compute_raster_extent,
     create_per_day_crops,
@@ -40,13 +47,6 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
-
-
-def randomise_mask_rgb(mask_np: np.ndarray) -> np.ndarray:
-    """Randomly recolour class-IDs → RGB (H × W × 3, uint8). Class 0 stays black."""
-    lut = (np.random.rand(256, 3) * 255).astype("uint8")
-    lut[0] = 0
-    return lut[mask_np]  # (H,W,3)
 
 
 def train_learnable_prompt(
@@ -232,10 +232,12 @@ def main(base_dir, crop_size, epochs, lr, n_prompts, prompt_dropout, out_ckpt):
     water_line = extract_linestring(water_mask, full_no_data)
     assert water_line is not None
     prompt_crops = generate_square_crops_along_line(water_line, crop_size, 0)
-    
+
     full_prompt_img, full_prompt_no_data = merge_tifs(ref_imgs, out_shape, out_transform, crs)
 
-    p_imgs, p_masks, p_nodata = create_per_day_crops(prompt_crops, full_prompt_img, full_prompt_no_data, merged_mask, crop_size)
+    p_imgs, p_masks, p_nodata = create_per_day_crops(
+        prompt_crops, full_prompt_img, full_prompt_no_data, merged_mask, crop_size
+    )
     keep = [i for i, nd in enumerate(p_nodata) if ~np.all(nd)]
     p_imgs = [p_imgs[i] for i in keep]
     p_masks = [p_masks[i] for i in keep]
