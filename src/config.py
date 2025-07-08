@@ -24,22 +24,24 @@ class BeachSegConfig:
     # Use False b/c TorchMetrics allocates too much memory otherwise
     deterministic: bool = False
     num_viz_images: int = 9
+    viz_size: int = 300
 
     epochs: int = 1
     debug: bool = False
     world_size: int = 1
     grad_accum_steps: int = 1
-    log_every_n_steps: int = 2
-    precision: str = "16-mixed"
+    log_every_n_steps: int = 10
+    # "16-mixed"
+    precision: str = "32-true"
     workers: int = -1
     batch_size: int = 1
 
     checkpoint: str = "BAAI/seggpt-vit-large"
 
-    monitor_metric: str = "f1"
+    monitor_metric: str = "val/f1"
     monitor_mode: str = "max"
 
-    crop_size: int = 224
+    crop_size: int = 448
     inpt_size: int = 448
     n_prompts: int = 1
     resample: Resampling = Resampling.BICUBIC
@@ -64,11 +66,11 @@ class BeachSegConfig:
     jigsaw_grid: tuple[int, int] = (2, 2)
     jigsaw_p: float = 0.0
 
-    lr: float = 1e-2
+    lr: float = 1e-3
     base_lr_batch_size: int = 1
     warmup_epochs: int = 3
-    init_lr: float = 5e-04
-    min_lr: float = 5e-04
+    init_lr: float = 5e-05
+    min_lr: float = 5e-05
     optimizer: str = "adamw"
     scheduler: str = "cosine"
     ema_alpha = 0.99

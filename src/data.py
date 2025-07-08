@@ -1,5 +1,4 @@
 import logging
-from pathlib import Path
 from typing import Any
 
 import kornia.augmentation as K
@@ -14,7 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 from src.config import BeachSegConfig, num_workers
 from src.geo_util import (
     compute_raster_extent,
-    create_per_day_crops,
+    crop_tif,
     extract_linestring,
     get_masks,
     group_images_by_date,
@@ -34,6 +33,29 @@ class MisconfigurationException(Exception):
     """Exception used to inform users of misuse with Lightning."""
 
 
+# See https://arxiv.org/pdf/2212.02499.pdf  at 3.1 Redefining Output Spaces as "Images" - Semantic Segmentation from PAINTER paper
+# Taken from
+# https://github.com/Abdullah-Meda/Painter/blob/main/Painter/data/coco_semseg/gen_color_coco_panoptic_segm.py#L31
+def build_palette(num_labels: int) -> list[tuple[int, int, int]]:
+    base = int(num_labels ** (1 / 3)) + 1
+    margin = 256 // base
+
+    # we assume that class_idx 0 is the background which is mapped to black
+    color_list = [(0, 0, 0)]
+    for location in range(num_labels):
+        num_seq_r = location // base**2
+        num_seq_g = (location % base**2) // base
+        num_seq_b = location % base
+
+        R = 255 - num_seq_r * margin
+        G = 255 - num_seq_g * margin
+        B = 255 - num_seq_b * margin
+
+        color_list.append((R, G, B))
+
+    return color_list
+
+
 def randomise_mask_rgb(mask_np: np.ndarray) -> np.ndarray:
     """Randomly recolour class-IDs → RGB (H × W × 3, uint8). Class 0 stays black."""
     lut = (np.random.rand(256, 3) * 255).astype("uint8")
@@ -41,7 +63,22 @@ def randomise_mask_rgb(mask_np: np.ndarray) -> np.ndarray:
     return lut[mask_np]  # (H,W,3)
 
 
-def torch_randomize_mask_rgb(input: torch.Tensor, num_labels: int) -> tuple[torch.Tensor, torch.Tensor]:
+def generate_random_rgb_palette(num_labels: int, batch_size: int, device) -> torch.Tensor:
+    # Create a random colour look‑up table for each sample
+    # Shape: (B, N, 3)  uint8  –  class‑0 stays black
+    lut = torch.randint(
+        low=0,
+        high=256,
+        size=(batch_size, num_labels, 3),
+        dtype=torch.uint8,
+        device=device,
+    )
+    lut[:, 0] = 0  # class‑0 ➜ black
+
+    return lut
+
+
+def torch_apply_mask_rgb(palette: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
     """
     Vectorised Torch implementation.
     `input` can be (B,1,H,W) or (B,H,W) with integer class‑IDs.
@@ -50,90 +87,110 @@ def torch_randomize_mask_rgb(input: torch.Tensor, num_labels: int) -> tuple[torc
     if input.ndim == 3:  # (B,H,W) ➜ (B,1,H,W)
         input = input.unsqueeze(1)
     mask = input.squeeze(1).to(torch.long)  # (B,H,W)
-    b, h, w = mask.shape
+    B, _, _ = mask.shape
     device = mask.device
-
-    # Create a random colour look‑up table for each sample
-    # Shape: (B, 256, 3)  uint8  –  class‑0 stays black
-    lut = torch.randint(
-        low=0,
-        high=256,
-        size=(b, num_labels, 3),
-        dtype=torch.uint8,
-        device=device,
-    )
-    lut[:, 0] = 0  # class‑0 ➜ black
 
     # Fancy‑index LUT with broadcasting:
     #   lut[batch_idx, class_id]  ➜ (B,H,W,3)
-    rgb = lut[torch.arange(b, device=device)[:, None, None], mask]  # (B,H,W,3)
+    rgb = palette[torch.arange(B, device=device)[:, None, None], mask]  # (B,H,W,3)
 
     # Rearrange to channels‑first & scale to [0,1] float32
     out = rgb.permute(0, 3, 1, 2).to(dtype=torch.float32) / 255.0  # (B,3,H,W)
-    return out, lut
+    return out
 
 
 class BeachSegDataset(Dataset):
     """
     Wraps a list of prompt crops.
-
-    Each __getitem__ returns SegGPT-ready tensors:
-        {
-            'prompt_pixel_values': Tensor(3,H,W),
-            'prompt_masks'       : Tensor(1,H,W)
-        }
     """
 
     def __init__(
         self,
-        date_img_paths: dict[str, list[Path]],
+        date_merged_imgs: dict[str, tuple[np.ndarray, np.ndarray]],
         date_masks: dict[str, np.ndarray] | None,
         crops: list[tuple[int, int, int, int]],
-        out_shape: tuple[int, int],
-        out_transform: Any,
-        crs: str,
         config: BeachSegConfig,
+        create_prompts: bool = False,
     ) -> None:
         if date_masks is None:
             date_masks = {}
 
         self.imgs = []
-        logger.info("Creating crops")
-        for date, img_paths in date_img_paths.items():
-            mask = date_masks.get(date, None)
+        self.date_merged_imgs = date_merged_imgs
+        self.date_masks = date_masks
+        self.crops = crops
+        self.config = config
 
-            merged_img, merged_no_data = merge_tifs(img_paths, out_shape, out_transform, crs)
+        for date, _ in date_merged_imgs.items():
+            full_mask = self.date_masks.get(date, None)
+            img, nodata = self.date_merged_imgs[date]
+            for crop_idx, crop in enumerate(self.crops):
+                if full_mask is not None:
+                    _, _, mask = crop_tif(crop, img, nodata, full_mask, self.config.crop_size)
+                    count_nodata = (mask == 0).sum()
+                else:
+                    count_nodata = 0
+                self.imgs.append({"date": date, "crop_idx": crop_idx, "count_nodata": count_nodata})
 
-            imgs, masks, nodatas = create_per_day_crops(crops, merged_img, merged_no_data, mask, config.crop_size)
-
-            for idx, (img, mask, nodata) in enumerate(zip(imgs, masks, nodatas)):
-                img = Image.fromarray(img)
-                img = img.resize((config.inpt_size, config.inpt_size), resample=config.resample)
-                img = np.array(img).astype(np.float32) / 255.0
-                mask = Image.fromarray(mask)
-                mask = np.array(mask.resize((config.inpt_size, config.inpt_size), resample=Resampling.NEAREST))
-                nodata = Image.fromarray(nodata)
-                nodata = np.array(nodata.resize((config.inpt_size, config.inpt_size), resample=Resampling.NEAREST))
-
-                # Hack to get nodata mask in when we don't have labels
-                if not np.all(nodata) and np.all(mask == 0):
-                    mask[~nodata] = 1
-
-                self.imgs.append(
-                    {
-                        "crop_idx": idx,
-                        "date": date,
-                        "image": img.transpose((2, 0, 1)).copy(),
-                        "mask": mask,
-                        "nodata": nodata,
-                    }
-                )
+        if create_prompts:
+            # indices of the crops with the *least* nodata pixels
+            n = self.config.n_prompts
+            self.prompt_indices = np.argsort([d["count_nodata"] for d in self.imgs])[:n]
+            self.prompt_imgs = []
+            for i in self.prompt_indices:
+                self.prompt_imgs.append(self.get_crop(self.imgs[i]))
+            self.imgs = [self.imgs[i] for i in range(len(self.imgs)) if i not in self.prompt_indices]
 
     def __len__(self):
         return len(self.imgs)
 
+    def get_crop(self, img_data: dict[str, Any]):
+        date = img_data["date"]
+        crop_idx = img_data["crop_idx"]
+        crop = self.crops[crop_idx]
+        img, nodata = self.date_merged_imgs[date]
+        label = self.date_masks.get(date, None)
+
+        crop_img, crop_nodata, crop_label = crop_tif(crop, img, nodata, label, self.config.crop_size)
+
+        if crop_label is None:
+            crop_label = np.zeros(crop_img.shape[:2], dtype=np.uint8)
+
+        crop_img = Image.fromarray(crop_img)
+        if self.config.inpt_size != self.config.crop_size:
+            crop_img = crop_img.resize((self.config.inpt_size, self.config.inpt_size), resample=self.config.resample)
+        crop_img = np.array(crop_img).astype(np.float32) / 255.0
+
+        crop_label = Image.fromarray(crop_label)
+        if self.config.inpt_size != self.config.crop_size:
+            crop_label = np.array(
+                crop_label.resize((self.config.inpt_size, self.config.inpt_size), resample=Resampling.NEAREST)
+            )
+        else:
+            crop_label = np.array(crop_label)
+
+        crop_nodata = Image.fromarray(crop_nodata)
+        if self.config.inpt_size != self.config.crop_size:
+            crop_nodata = np.array(
+                crop_nodata.resize((self.config.inpt_size, self.config.inpt_size), resample=Resampling.NEAREST)
+            )
+        else:
+            crop_nodata = np.array(crop_nodata)
+
+        # Hack to get nodata mask in when we don't have labels
+        if not np.all(nodata) and np.all(crop_label == 0):
+            crop_label[~nodata] = 1
+
+        return {
+            "crop_idx": crop_idx,
+            "date": date,
+            "image": crop_img.transpose((2, 0, 1)).copy(),
+            "mask": crop_label,
+            "nodata": crop_nodata,
+        }
+
     def __getitem__(self, idx):
-        return self.imgs[idx]
+        return self.get_crop(self.imgs[idx])
 
 
 def create_dataset(config: BeachSegConfig, train: bool) -> BeachSegDataset:
@@ -167,26 +224,21 @@ def create_dataset(config: BeachSegConfig, train: bool) -> BeachSegDataset:
     prompt_crops = generate_square_crops_along_line(water_line, config.crop_size, 0)
 
     if train:
+        date_img_paths = {mask_date: ref_imgs}
+    else:
+        date_img_paths = groups
 
-        return BeachSegDataset(
-            date_img_paths={mask_date: ref_imgs},
-            date_masks={mask_date: merged_mask},
-            crops=prompt_crops,
-            out_shape=out_shape,
-            out_transform=out_transform,
-            crs=crs,
-            config=config,
-        )
+    date_merged_imgs = {}
+    for date, img_paths in date_img_paths.items():
+        merged_img, merged_no_data = merge_tifs(img_paths, out_shape, out_transform, crs)
+        date_merged_imgs[date] = (merged_img, merged_no_data)
 
-    # val/pred
     return BeachSegDataset(
-        groups,
-        {mask_date: merged_mask},
-        prompt_crops,
-        out_shape=out_shape,
-        out_transform=out_transform,
-        crs=crs,
+        date_merged_imgs=date_merged_imgs,
+        date_masks={mask_date: merged_mask},
+        crops=prompt_crops,
         config=config,
+        create_prompts=train,
     )
 
 
@@ -252,14 +304,15 @@ class BeachSegDataModule(pl.LightningDataModule):
         """Set up datasets.
 
         Args:
-            stage: Either 'fit', 'validate', 'test', or 'predict'.
+            stage: Either 'fit', 'train', 'validate', 'test', or 'predict'.
         """
-        self.train_dataset = create_dataset(self.config, True)
-        logger.info(f"🗂  Train dataset loaded with {len(self.train_dataset)} samples")
+        if stage in ["fit", "train"]:
+            self.train_dataset = create_dataset(self.config, train=True)
+            logger.info(f"🗂  Train dataset loaded with {len(self.train_dataset)} samples")
 
-        # if stage in ["fit", "validate"]:
-        #     self.val_dataset = create_dataset(self.config, False)
-        #     logger.info(f"🗂  Val dataset loaded with {len(self.val_dataset)} samples")
+        if stage in ["fit", "validate"]:
+            self.val_dataset = create_dataset(self.config, train=True)
+            logger.info(f"🗂  Val dataset loaded with {len(self.val_dataset)} samples")
 
         # if stage in ["test"]:
         #     self.test_dataset = create_dataset(self.config, False)
@@ -269,14 +322,10 @@ class BeachSegDataModule(pl.LightningDataModule):
             self.predict_dataset = create_dataset(self.config, False)
             logger.info(f"🗂  Predict dataset loaded with {len(self.predict_dataset)} samples")
 
-        # indices of the crops with the *least* nodata pixels
-        self.prompt_indices = np.argsort([np.sum(d["mask"] == 0) for d in self.train_dataset.imgs])[
-            : self.config.n_prompts
-        ]
-        self.prompt_imgs = [self.train_dataset.imgs[i] for i in self.prompt_indices]
-        self.train_dataset.imgs = [
-            self.train_dataset.imgs[i] for i in range(len(self.train_dataset.imgs)) if i not in self.prompt_indices
-        ]
+        if not hasattr(self, "prompt_indices") is None:
+            self.prompt_indices = self.train_dataset.prompt_indices
+            self.prompt_imgs = self.train_dataset.prompt_imgs
+
         logger.info(
             f"🎯 Selected {len(self.prompt_indices)} prompt crops "
             f"(keeping {len(self.train_dataset.imgs)} for training)"
@@ -289,6 +338,16 @@ class BeachSegDataModule(pl.LightningDataModule):
             dataset=self.train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
+            num_workers=nw,
+            persistent_workers=nw > 0,
+        )
+
+    def val_dataloader(self):
+        nw = num_workers(self.config)
+        return DataLoader(
+            dataset=self.val_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
             num_workers=nw,
             persistent_workers=nw > 0,
         )
@@ -313,15 +372,10 @@ class BeachSegDataModule(pl.LightningDataModule):
         """
         if self.trainer:
             if self.trainer.training:
-                split = "train"
-            elif self.trainer.validating or self.trainer.sanity_checking:
-                split = "val"
-            elif self.trainer.testing:
-                split = "test"
-            elif self.trainer.predicting:
-                split = "predict"
+                aug = self.train_aug
+            else:
+                aug = self.aug
 
-            aug = self._valid_attribute(f"{split}_aug", "aug")
             batch = aug(batch)
 
         return batch

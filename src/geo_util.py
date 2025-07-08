@@ -258,12 +258,14 @@ def merged_no_data_mask(water_mask: np.ndarray, veg_mask: np.ndarray) -> np.ndar
 
             # veg to right of water
             if veg_start >= water_end:
+                start = veg_end + 1
                 line_no_data[row, :water_start] = True
-                line_no_data[row, veg_end + 1:] = True
+                line_no_data[row, start:] = True
             elif veg_start <= water_end:
                 # veg to left of water
+                start = water_end + 1
                 line_no_data[row, :veg_start] = True
-                line_no_data[row, water_end + 1:] = True
+                line_no_data[row, start:] = True
 
     return line_no_data
 
@@ -282,17 +284,38 @@ def create_per_day_crops(
     prompt_labels = [np.zeros((crop_size, crop_size), dtype=np.uint8) for _ in range(len(crops))]
     prompt_nodata_masks = [np.ones((crop_size, crop_size), dtype=np.uint8) for _ in range(len(crops))]
 
-    for c_idx, (xmin, ymin, xmax, ymax) in enumerate(crops):
-        prompt_imgs[c_idx] = padded_crop(img, xmin, ymin, xmax, ymax, crop_size)
-        prompt_nodata_masks[c_idx] = padded_crop(nodata, xmin, ymin, xmax, ymax, crop_size, value=1)
-        if label is not None:
-            prompt_labels[c_idx] = padded_crop(label, xmin, ymin, xmax, ymax, crop_size)
+    for c_idx, crop in enumerate(crops):
+        crop_img, crop_nodata, crop_label = crop_tif(crop, img, nodata, label, crop_size)
+        prompt_imgs[c_idx] = crop_img
+        prompt_nodata_masks[c_idx] = crop_nodata
+        if crop_label is not None:
+            prompt_labels[c_idx] = crop_label
 
     return prompt_imgs, prompt_labels, prompt_nodata_masks
 
 
+def crop_tif(
+    crop: tuple[int, int, int, int],
+    img: np.ndarray,
+    nodata: np.ndarray,
+    label: np.ndarray | None,
+    crop_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    (xmin, ymin, xmax, ymax) = crop
+    # background is green for img
+    crop_img = padded_crop(img, xmin, ymin, xmax, ymax, crop_size, value=[0, 255, 0])
+    crop_nodata = padded_crop(nodata, xmin, ymin, xmax, ymax, crop_size, value=1)
+
+    if label is not None:
+        crop_label = padded_crop(label, xmin, ymin, xmax, ymax, crop_size)
+    else:
+        crop_label = None
+
+    return crop_img, crop_nodata, crop_label
+
+
 def padded_crop(
-    arr: np.ndarray, xmin: int, ymin: int, xmax: int, ymax: int, crop_size: int, value: int = 0
+    arr: np.ndarray, xmin: int, ymin: int, xmax: int, ymax: int, crop_size: int, value: int | list[int] = 0
 ) -> np.ndarray:
     """
     Extract a crop from mask_array with zero padding for out-of-bounds areas.
@@ -427,14 +450,21 @@ def tif_image(data, nodata):
     if C == 8:
         img = broad_band(data, nodata)
     else:
-        img = np.log10(1 + data[[3, 2, 1]])
+        img = data[[3, 2, 1]]
         for i in range(3):
-            img[i] -= img[i][~nodata].min()
-            img[i] /= img[i][~nodata].max()
+            min_val = img[i][~nodata].min()
+            img[i] = img[i].clip(min_val, min_val + 3000)
+            img[i] -= min_val
+        # img = np.log10(1 + img)
+        for i in range(3):
+            img[i] -= img[i].min()
+            img[i] /= img[i].max()
             img[i][nodata] = 0
+        img[1][nodata] = 1.0
         img = img.transpose((1, 2, 0)).copy()
 
-    img = np.array(exposure.equalize_adapthist(img) * 255, dtype=np.uint8)
+    img = np.array(img * 255, dtype=np.uint8)
+    # img = np.array(exposure.equalize_adapthist(img) * 255, dtype=np.uint8)
     return img
 
 

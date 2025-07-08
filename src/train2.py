@@ -90,6 +90,7 @@ def main():
         devices=devices,
         accelerator=conf.accelerator,
         log_every_n_steps=conf.log_every_n_steps,
+        accumulate_grad_batches=13,
     )
 
     if trainer.is_global_zero:
