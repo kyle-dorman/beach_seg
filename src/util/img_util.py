@@ -8,6 +8,9 @@ from PIL import Image
 local_logger = logging.getLogger(__name__)
 
 
+CLASS_COLORS = ["limegreen", "hotpink", "lightcyan", "yellow"]
+
+
 def contrast_stretch(image: np.ndarray | MaskedArray, p_low: int = 2, p_high: int = 98) -> np.ndarray:
     """Perform contrast stretching using percentiles."""
     image = image.astype(np.float32)
@@ -55,5 +58,3 @@ def masked_contrast_stretch(image: np.ndarray, mask: np.ndarray, p_low: int | No
 def write_1bit_png(filename: Path, img: np.ndarray) -> None:
     i = Image.fromarray(img).convert(mode="1", dither=Image.Dither.NONE)
     i.save(filename, optimize=True)
-
-
