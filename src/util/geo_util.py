@@ -19,7 +19,7 @@ from shapely.geometry import LineString, MultiLineString, Polygon
 from shapely.ops import linemerge
 from skimage import exposure, measure
 
-from src.multichannel_img import broad_band
+from src.util.multichannel_img import broad_band
 
 local_logger = logging.getLogger(__name__)
 
@@ -331,11 +331,13 @@ def padded_crop(
     x1 = min(xmax, w)
     y0 = max(ymin, 0)
     y1 = min(ymax, h)
+
     # Compute slices
     ystart = y0 - ymin
-    yend = y1 - ymin
+    yend = ystart + (y1 - y0)
     xstart = x0 - xmin
-    xend = x1 - xmin
+    xend = xstart + (x1 - x0)
+
     padded[ystart:yend, xstart:xend] = arr[y0:y1, x0:x1]
     return padded
 

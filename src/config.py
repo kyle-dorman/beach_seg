@@ -24,7 +24,7 @@ class BeachSegConfig:
     # Use False b/c TorchMetrics allocates too much memory otherwise
     deterministic: bool = False
     num_viz_images: int = 9
-    viz_size: int = 300
+    viz_size: int = 224
 
     epochs: int = 1
     debug: bool = False
@@ -41,9 +41,10 @@ class BeachSegConfig:
     monitor_metric: str = "val/f1"
     monitor_mode: str = "max"
 
-    crop_size: int = 448
+    crop_size: int = 336
     inpt_size: int = 448
-    n_prompts: int = 1
+    # n_prompts: int = 1
+    # max_pct_nodata: float = 0.5
     resample: Resampling = Resampling.BICUBIC
 
     horizontal_flip: float = 0.5
@@ -67,10 +68,11 @@ class BeachSegConfig:
     jigsaw_p: float = 0.0
 
     lr: float = 1e-3
+    loss_beta: float = 0.01
     base_lr_batch_size: int = 1
-    warmup_epochs: int = 3
-    init_lr: float = 5e-05
-    min_lr: float = 5e-05
+    warmup_epochs: int = 0
+    init_lr: float = 5e-04
+    min_lr: float = 5e-04
     optimizer: str = "adamw"
     scheduler: str = "cosine"
     ema_alpha = 0.99

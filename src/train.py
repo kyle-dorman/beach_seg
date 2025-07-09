@@ -1,269 +1,132 @@
-#!/usr/bin/env python
-"""
-Train a learnable image-space prompt for SegGPT shoreline extraction.
-Outputs a single .pt checkpoint containing:
-  ├─ 'prompt_pixel_values'  # (P, 3, H, W)
-  └─ 'prompt_masks'         # (P, 1, H, W)
-"""
 import logging
-import random
-from collections import deque
+import os
 from pathlib import Path
-from typing import Any
 
-import click
-import kornia.augmentation as K
-import lightning.pytorch as pl  # NEW
-import numpy as np  # NEW
 import torch
-from PIL import Image
-from PIL.Image import Resampling
-from torch.utils.data import DataLoader, Dataset  # NEW
-from torchvision import transforms as T
-from tqdm import tqdm
-from transformers import SegGptForImageSegmentation, SegGptImageProcessor
+from dotenv import find_dotenv, load_dotenv
+from lightning.pytorch import Trainer, seed_everything
+from lightning.pytorch.callbacks import LearningRateMonitor
+from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
+from omegaconf import DictConfig, OmegaConf
 
 from src.config import BeachSegConfig
-from src.geo_util import (
-    compute_raster_extent,
-    create_per_day_crops,
-    extract_linestring,
-    get_masks,
-    group_images_by_date,
-    infer_date,
-    load_and_merge_masks,
-    merge_tifs,
-    merged_no_data_mask,
-    rasterize_gdf,
-)
-from src.ml_util import generate_square_crops_along_line, load_model
+from src.data import BeachSegDataModule
+from src.model import PromptModel
+from src.util.util import setup_logger
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
+def handle_item(v):
+    if isinstance(v, torch.Tensor):
+        return v.detach().cpu()
+    else:
+        return v
 
 
-def train_learnable_prompt(
-    model: SegGptForImageSegmentation,
-    processor: SegGptImageProcessor,
-    prompt_imgs: list[np.ndarray],
-    prompt_masks: list[np.ndarray],
-    prompt_nodatas: list[np.ndarray],
-    *,
-    num_labels: int = 3,
-    epochs: int = 300,
-    lr: float = 1e-2,
-    n_prompts: int = 1,
-    prompt_dropout: float = 0.1,
-    device: str | torch.device = "cuda" if torch.cuda.is_available() else "cpu",
-) -> tuple[torch.Tensor, torch.Tensor]:
+def main():
     """
-    Learn one or more image-space prompt tensors.
-
-    Returns
-    -------
-    prompt_pixel_values : torch.Tensor  # (P, 3, H, W)
-    prompt_masks        : torch.Tensor  # (P, 1, H, W)
+    trains model
     """
-    model.to(device).eval()  # type: ignore
+    base_conf = OmegaConf.structured(BeachSegConfig)
+    cli_conf = OmegaConf.from_cli()
+    # cli_conf = OmegaConf.load("train.yaml")
+    assert isinstance(cli_conf, DictConfig)
 
-    g = torch.Generator(device=device)
-    g.manual_seed(SEED)
+    conf: BeachSegConfig = OmegaConf.merge(base_conf, cli_conf)  # type: ignore
 
-    # Suppose your processor defines these
-    mean = processor.image_mean  # e.g. [0.485, 0.456, 0.406]
-    std = processor.image_std  # e.g. [0.229, 0.224, 0.225]
-    assert isinstance(mean, list)
-    assert isinstance(std, list)
+    # Skip in DDP
+    rank = os.environ.get("NODE_RANK", None)
+    model_training_root = Path(conf.model_training_root) / conf.project / "train"
+    model_training_root.mkdir(exist_ok=True, parents=True)
+    runs = [int(p.name) for p in model_training_root.iterdir() if not p.name.startswith(".")]
+    last_id = max(runs + [-1])
+    if rank is None:
+        model_dir = model_training_root / str(last_id + 1).zfill(5)
 
-    # Build a “denormalize” transform
-    denormalize = T.Normalize(mean=[-m / s for m, s in zip(mean, std)], std=[1 / s for s in std])
-    normalize = T.Normalize(mean=mean, std=std)
-    photo_jitter = T.ColorJitter(hue=0.1, saturation=0.15, brightness=0.15)
-    geom_jitter = T.RandomAffine(degrees=5, translate=(0.02, 0.02))  # ≈±3 px on 224-px crop
-    jitter_tensor = T.Compose(
-        [denormalize, photo_jitter, geom_jitter, normalize]  # get back into [0,1]  # back to zero‐mean/unit‐var
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "wandb").mkdir(exist_ok=True)
+        (model_dir / "checkpoints").mkdir(exist_ok=True)
+        log_file_name = "log.log"
+    else:
+        model_dir = model_training_root / str(last_id).zfill(5)
+        log_file_name = f"log_{rank}.log"
+
+    # Setup logger
+    setup_logger(logger, model_dir, log_file_name)
+
+    logger.info(f"Saving results to {model_dir}")
+    logger.info(f"Training semantic segmentation model with classes {conf.classes}")
+
+    seed_everything(conf.seed, workers=True)
+
+    # if rank is None:
+    #     num_gpus = 1  # max(1, calc_num_gpus(conf))
+
+    #     assert (
+    #         conf.world_size == num_gpus
+    #     ), f"Must set config world_size equal to number of gpus. world_size: {conf.world_size}. gpus: {num_gpus}"
+
+    # Load model and data
+    datamodule = BeachSegDataModule(config=conf)
+    datamodule.setup("train")
+    model = PromptModel(conf)
+    model.post_init(datamodule)
+    model.create_trainable_params(datamodule)
+    prompt_batch = {k: handle_item(v) for k, v in model.prompt_batch.items()}
+    torch.save(prompt_batch, model_dir / "prompt_batch.pt")
+
+    # wandb_logger = WandbLogger(log_model="all", project=conf.project, save_dir=model_dir)
+    tensorboard_logger = TensorBoardLogger(model_dir)
+    csv_logger = CSVLogger(model_dir)
+    # checkpoint_callback = ModelCheckpoint(
+    #     dirpath=model_dir / "checkpoints",
+    #     monitor=conf.monitor_metric,
+    #     mode=conf.monitor_mode,
+    #     every_n_epochs=1,
+    #     save_last=True,
+    #     save_weights_only=True,
+    # )
+    lr_monitor = LearningRateMonitor("epoch")
+    # bs_finder = BatchSizeFinder()
+    # device_stats = DeviceStatsMonitor()
+
+    assert len(conf.devices) > 0
+
+    devices = list(map(int, conf.devices)) if len(conf.devices) > 1 else conf.devices[0]
+    trainer = Trainer(
+        max_epochs=conf.epochs * len(prompt_batch),
+        default_root_dir=model_dir / "checkpoints",
+        precision=conf.precision,  # type: ignore
+        logger=[tensorboard_logger, csv_logger],  # wandb_logger,
+        callbacks=[lr_monitor],  # bs_finder, device_stats, checkpoint_callback
+        deterministic=conf.deterministic,
+        devices=devices,
+        accelerator=conf.accelerator,
+        log_every_n_steps=conf.log_every_n_steps,
     )
 
-    # ── pick the P crops with most valid pixels ────────────────────────────────
-    order = np.argsort([np.sum(n) for n in prompt_nodatas])[:n_prompts]
+    if trainer.is_global_zero:
+        # Save conf
+        OmegaConf.save(config=conf, f=model_dir / "conf.yaml")
+        # wandb_logger.log_hyperparams(dict(conf))  # type: ignore
 
-    prompt_params, fixed_masks, ema_buffers = [], [], []
-    for idx in order:
-        # pixel tensor
-        init_px = processor(images=[prompt_imgs[idx]], data_format="channels_first", return_tensors="pt")[
-            "pixel_values"
-        ][0].to(device)
-        p = torch.nn.Parameter(init_px, requires_grad=True)
-        prompt_params.append(p)
-        ema_buffers.append(p.detach().clone())
+    # Train!
+    trainer.fit(model=model, datamodule=datamodule)  # type: ignore
 
-        # coloured mask tensor (CHW)
-        coloured = randomise_mask_rgb(prompt_masks[idx]).transpose(2, 0, 1)
-        fm = processor.preprocess(
-            # prompt_images=[prompt_imgs[idx]],
-            prompt_masks=[coloured],
-            num_labels=num_labels,
-            data_format="channels_first",
-            return_tensors="pt",
-            do_convert_rgb=False,
-        )["prompt_masks"][0].to(device)
-        fixed_masks.append(fm)
+    if trainer.is_global_zero:
+        with open(model_dir / "classes.txt", "w") as f:
+            f.write("\n".join(conf.classes))
 
-    params = torch.nn.ParameterList(prompt_params)
-    ema = deque(ema_buffers, maxlen=n_prompts)
+        prompt_batch = {k: handle_item(v) for k, v in model.prompt_batch.items()}
+        torch.save(prompt_batch, model_dir / "prompt_batch.pt")
 
-    # ── build query batches (exclude the P prompt crops) ───────────────────────
-    batch_data = [
-        processor.preprocess(
-            prompt_images=[im],
-            prompt_masks=[msk],
-            num_labels=num_labels,
-            data_format="channels_first",
-            return_tensors="pt",
-        )
-        for i, (im, msk) in enumerate(zip(prompt_imgs, prompt_masks))
-        if i not in order
-    ]
-
-    opt = torch.optim.AdamW(params, lr=lr)
-    alpha = 0.99  # EMA decay
-
-    for ep in tqdm(range(epochs), desc="Prompt training", unit="epoch", leave=False):
-        running = 0.0
-        for query in batch_data:
-            opt.zero_grad()
-
-            # choose prompt index
-            pi: int = torch.randint(0, n_prompts, (), generator=g).item()  # type: ignore
-            px = params[pi]
-
-            # optional dropout preserving gradient flow
-            if torch.rand((), generator=g).item() < prompt_dropout:
-                px_fwd = px * 0
-            else:
-                px_fwd = jitter_tensor(px)
-                # recolour mask for this epoch
-                coloured = randomise_mask_rgb(prompt_masks[order[pi]]).transpose(2, 0, 1)
-                fixed_masks[pi] = processor.preprocess(
-                    # prompt_images=[prompt_imgs[order[pi]]],
-                    prompt_masks=[coloured],
-                    num_labels=num_labels,
-                    data_format="channels_first",
-                    return_tensors="pt",
-                    do_convert_rgb=False,
-                )["prompt_masks"][0].to(device)
-
-            out = model(
-                pixel_values=query["prompt_pixel_values"].to(device),
-                prompt_pixel_values=px_fwd.unsqueeze(0),
-                prompt_masks=fixed_masks[pi].unsqueeze(0),
-                labels=query["prompt_masks"].to(device),
-                embedding_type="semantic",
-            )
-            out.loss.backward()
-            opt.step()
-            running += out.loss.item()
-
-            # EMA update
-            ema[pi].mul_(alpha).add_(px.data, alpha=1 - alpha)
-
-        tqdm.write(f"epoch {ep:03d}  loss={running / len(batch_data):.4f}")
-
-    stacked_px = torch.stack(list(ema)).cpu()
-    stacked_msk = torch.stack(fixed_masks).cpu()
-    return stacked_px, stacked_msk
-
-
-@click.command()
-@click.option(
-    "--base-dir",
-    "-b",
-    type=click.Path(exists=True),
-    required=True,
-    help="Project directory (expects Masks/, SatelliteImagery/ sub-folders)",
-)
-@click.option("--crop-size", "-c", default=224, show_default=True, help="Square crop size in pixels")
-@click.option("--epochs", "-e", default=300, show_default=True, help="Prompt-training epochs")
-@click.option("--lr", default=1e-2, show_default=True, help="Learning-rate")
-@click.option("--n-prompts", default=1, show_default=True, help="Number of prompt tensors to learn (feature ensemble)")
-@click.option("--prompt-dropout", default=0.1, show_default=True, help="Probability to zero a prompt during training")
-@click.option(
-    "--out-ckpt",
-    "-o",
-    type=click.Path(dir_okay=False, writable=True),
-    required=True,
-    help="Where to write the learned prompt checkpoint (.pt)",
-)
-def main(base_dir, crop_size, epochs, lr, n_prompts, prompt_dropout, out_ckpt):
-
-    base_path = Path(base_dir)
-
-    # ── Gather reference imagery and masks ───────────────────────────────────
-    mask_dir = base_path / "Masks"
-    veg_masks = get_masks(mask_dir, "Mask_*.shp")
-    water_masks = get_masks(mask_dir, "WaterMask_*.shp")
-    mask_date = infer_date(veg_masks + water_masks)
-
-    img_paths = list((base_path / "SatelliteImagery").glob("*/*.tif"))
-    groups = group_images_by_date(img_paths)
-    ref_imgs = groups.pop(mask_date, [])  # reference date imagery only
-    assert len(ref_imgs)
-
-    out_transform, out_shape, crs = compute_raster_extent(ref_imgs)
-    veg_gdf = load_and_merge_masks(veg_masks)
-    veg_mask = rasterize_gdf(veg_gdf, out_shape, out_transform) == 1
-    water_gdf = load_and_merge_masks(water_masks)
-    water_mask = rasterize_gdf(water_gdf, out_shape, out_transform) == 1
-    full_no_data = merged_no_data_mask(water_mask, veg_mask)
-    sand_mask = ~(full_no_data | water_mask | veg_mask)
-    merged_mask = np.zeros((*veg_mask.shape, 3), dtype=np.uint8)
-    merged_mask[water_mask] = 1
-    merged_mask[veg_mask] = 2
-    merged_mask[sand_mask] = 3
-
-    # ── Build crops along water line ─────────────────────────────────────────
-    water_line = extract_linestring(water_mask, full_no_data)
-    assert water_line is not None
-    prompt_crops = generate_square_crops_along_line(water_line, crop_size, 0)
-
-    full_prompt_img, full_prompt_no_data = merge_tifs(ref_imgs, out_shape, out_transform, crs)
-
-    p_imgs, p_masks, p_nodata = create_per_day_crops(
-        prompt_crops, full_prompt_img, full_prompt_no_data, merged_mask, crop_size
-    )
-    keep = [i for i, nd in enumerate(p_nodata) if ~np.all(nd)]
-    p_imgs = [p_imgs[i] for i in keep]
-    p_masks = [p_masks[i] for i in keep]
-    p_nodata = [p_nodata[i] for i in keep]
-
-    # ── Train prompt tensors ────────────────────────────────────────────────
-    logger.info(f"Training {n_prompts} prompt tensor(s) on {len(p_imgs)} crops")
-    model, processor = load_model()
-    prompt_px, prompt_msk = train_learnable_prompt(
-        model,
-        processor,
-        p_imgs,
-        p_masks,
-        p_nodata,
-        epochs=epochs,
-        lr=lr,
-        n_prompts=n_prompts,
-        prompt_dropout=prompt_dropout,
-    )
-
-    torch.save(
-        {"prompt_pixel_values": prompt_px, "prompt_masks": prompt_msk},
-        out_ckpt,
-    )
-    logger.info(f"✓ Saved learned prompt ➜ {out_ckpt}")
+    logger.info("Done!")
 
 
 if __name__ == "__main__":
+    # find .env automagically by walking up directories until it's found, then
+    # load up the .env entries as environment variables
+    load_dotenv(find_dotenv())
+
     main()

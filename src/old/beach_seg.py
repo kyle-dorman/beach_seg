@@ -11,7 +11,7 @@ from shapely.ops import transform
 from tqdm import tqdm
 from transformers import SegGptForImageSegmentation, SegGptImageProcessor
 
-from src.geo_util import (
+from src.util.geo_util import (
     compute_raster_extent,
     create_per_day_crops,
     extract_linestring,
@@ -24,7 +24,7 @@ from src.geo_util import (
     safe_assign_crop,
     save_tif,
 )
-from src.ml_util import generate_square_crops_along_line, load_model
+from src.util.ml_util import generate_square_crops_along_line, load_model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)

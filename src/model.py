@@ -1,5 +1,4 @@
 import logging
-from collections import deque
 
 import torch
 import torch.nn.functional as F
@@ -16,12 +15,10 @@ from torchvision.utils import draw_segmentation_masks
 
 from src.config import BeachSegConfig
 from src.data import BeachSegDataModule, build_palette, generate_random_rgb_palette, torch_apply_mask_rgb
-from src.ml_util import load_model
+from src.util.img_util import CLASS_COLORS
+from src.util.ml_util import load_model
 
 logger = logging.getLogger(__name__)
-
-
-CLASS_COLORS = ["limegreen", "hotpink", "lightcyan", "yellow"]
 
 
 def plot_masks(
@@ -39,8 +36,35 @@ def plot_masks(
     )
 
 
+class SegGptLoss(torch.nn.Module):
+    def __init__(self, beta):
+        super().__init__()
+        self.beta = beta
+
+    def forward(self, pred_masks: torch.FloatTensor, labels: torch.FloatTensor, yesdata: torch.BoolTensor):
+        """Computes the L1 loss between the predicted masks and the ground truth masks.
+
+        Returns:
+            `torch.FloatTensor`: The mean L1 loss between the predicted masks and the ground truth masks.
+        """
+        B, C, H2, W = pred_masks.shape
+        H = H2 // 2
+        blank = torch.zeros((B, C, H, W), dtype=pred_masks.dtype, device=pred_masks.device)
+        label_mask = torch.concat([blank, labels], dim=2)
+        keep_mask = torch.concat(
+            [blank, yesdata.expand((-1, C, -1, -1)).to(pred_masks.dtype)],
+            dim=2,
+        )
+
+        loss = F.smooth_l1_loss(pred_masks, label_mask, reduction="none", beta=self.beta)
+        loss = loss * keep_mask.unsqueeze(1).to(loss.dtype)
+        loss = loss.sum() / keep_mask.sum()  # mean loss on removed patches
+
+        return loss
+
+
 class PromptModel(LightningModule):
-    def __init__(self, conf: BeachSegConfig, datamodule: BeachSegDataModule):
+    def __init__(self, conf: BeachSegConfig):
         logger.info("🔧 Initialising PromptModel")
         self.conf = conf
         self.num_classes = len(conf.classes)
@@ -67,32 +91,16 @@ class PromptModel(LightningModule):
         self.train_metrics = metrics.clone(prefix="train/")
         self.val_metrics = metrics.clone(prefix="val/")
         logger.info("✔️  Metrics configured: %s", list(self.train_metrics.keys()))
-        datamodule.setup("train")
-        logger.info(
-            "✔️  DataModule setup: %d training samples, %d prompt crops",
-            len(datamodule.train_dataset),
-            len(datamodule.prompt_imgs),
-        )
-
-        prompt_params, self.ema_buffers = [], []
-        self.prompt_batch: dict[str, torch.Tensor] = _utils.collate.default_collate(
-            datamodule.prompt_imgs
-        )  # type: ignore
-
-        for idx in range(conf.n_prompts):
-            init_px = self.prompt_batch["image"][idx]
-            p = torch.nn.Parameter(init_px, requires_grad=True)
-            prompt_params.append(p)
-            self.ema_buffers.append(p.detach().clone())
-        logger.info("✔️  Created %d trainable prompt tensors", len(prompt_params))
-
-        self.prompt_params_list = torch.nn.ParameterList(prompt_params)
-        self.prompt_batch["image"] = prompt_params  # type: ignore
-        self.ema = deque(self.ema_buffers, maxlen=conf.n_prompts)
 
         self.val_batch_pred = []
+        self.train_batch_pred = []
         self.g = torch.Generator(device=self.model.device)  # type: ignore
         self.g.manual_seed(conf.seed)
+        self.loss_fn = SegGptLoss(conf.loss_beta)
+
+        logger.info("✅ PromptModel initialisation complete")
+
+    def post_init(self, datamodule: BeachSegDataModule):
         self.train_aug = datamodule.train_aug
         self.aug = datamodule.aug
         self.normalize = datamodule.normalize
@@ -103,11 +111,39 @@ class PromptModel(LightningModule):
             len(self.aug),
         )
 
-        logger.info("✅ PromptModel initialisation complete")
+    def create_trainable_params(self, datamodule: BeachSegDataModule):
+        prompt_imgs = datamodule.prompt_imgs
 
-    def forward(self, x):
-        assert False, "Add prompt"
-        return self.model(x)  # type: ignore
+        prompt_params = []
+        self.prompt_batch: dict[str, torch.Tensor] = _utils.collate.default_collate(prompt_imgs)  # type: ignore
+
+        for idx in range(len(prompt_imgs)):
+            init_px = self.prompt_batch["image"][idx]
+            p = torch.nn.Parameter(init_px, requires_grad=True)
+            prompt_params.append(p)
+            # self.ema_buffers.append(p.detach().clone())
+        logger.info("✔️  Created %d trainable prompt tensors", len(prompt_params))
+
+        self.prompt_params_list = torch.nn.ParameterList(prompt_params)
+        self.prompt_batch["image"] = prompt_params  # type: ignore
+        # self.ema = deque(self.ema_buffers, maxlen=self.conf.n_prompts)
+
+    def forward(self, batch_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+        B, _, _, _ = batch_dict["image"].shape
+        batch_palette, batch_palette_norm = self.create_palette(B, train=True)
+
+        # choose prompt index
+        prompt_batch, prompt_masks = self.prepare_prompt(batch_dict["crop_idx"], batch_palette, train=False)
+
+        out = self.model(
+            pixel_values=batch_dict["image"],
+            prompt_pixel_values=prompt_batch["image"],
+            prompt_masks=prompt_masks,
+            embedding_type="semantic",
+        )
+        pred_masks = self.process_pred_masks(out.pred_masks, batch_palette_norm)
+
+        return pred_masks
 
     def one_hot(self, x: torch.Tensor, num_classes: int) -> torch.Tensor:
         B, H, W = x.shape
@@ -117,7 +153,7 @@ class PromptModel(LightningModule):
 
     def process_pred_masks(self, in_pred_masks: torch.Tensor, batch_palette_norm: torch.Tensor) -> torch.Tensor:
         # batch_size x num_channels x 2*height x width
-        B, C, H2, W = in_pred_masks.shape
+        _, _, H2, _ = in_pred_masks.shape
         H = H2 // 2
 
         # Predicted mask and prompt are concatenated in the height dimension
@@ -138,27 +174,48 @@ class PromptModel(LightningModule):
         return torch.stack(pred_masks, dim=0).to(self.device)
 
     def prepare_prompt(
-        self, idx: int, batch_palette: torch.Tensor, train: bool
+        self, batch_idxes: torch.Tensor | int, batch_palette: torch.Tensor, train: bool
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        start = idx
-        end = start + 1
-        prompt_batch = {k: self.prompt_batch[k][start:end] for k in self.prompt_batch.keys()}
-        # convert list of Parameters into a single Tensor for augmentation
+        # -------- Normalise `batch_idxes` to a Python list of ints ----------------------
+        if isinstance(batch_idxes, torch.Tensor):
+            batch_idx_list = batch_idxes.flatten().tolist()
+        elif isinstance(batch_idxes, int):
+            batch_idx_list = [batch_idxes]
+        else:  # assume Iterable[int]
+            batch_idx_list = list(batch_idxes)
+
+        # -------- Gather the requested prompt items -------------------------------------
+        prompt_batch: dict[str, list[torch.Tensor]] = {}
+        for key, value in self.prompt_batch.items():
+            # `self.prompt_batch[key]` is a list‐like container (e.g. list of Parameter/Tensor)
+            prompt_batch[key] = [value[i] for i in batch_idx_list]
+
+        # Convert 'image' list[Parameter] → tensor so that augmentations work
         prompt_batch["image"] = torch.stack(prompt_batch["image"], dim=0).to(self.device)  # type: ignore
+
+        # Convert 'mask' to a tensor batch if it is not already one
+        if isinstance(prompt_batch["mask"], list):
+            prompt_batch["mask"] = torch.stack(prompt_batch["mask"], dim=0).to(self.device)  # type: ignore
+        else:
+            prompt_batch["mask"] = prompt_batch["mask"].to(self.device)  # type: ignore
+
+        # -------- Apply augmentations ----------------------------------------------------
         if train:
             prompt_batch = self.train_aug(prompt_batch)
         else:
             prompt_batch = self.aug(prompt_batch)
-        prompt_color_mask = torch_apply_mask_rgb(batch_palette, prompt_batch["mask"])
+
+        # -------- Create normalised colour prompt mask -----------------------------------
+        prompt_color_mask = torch_apply_mask_rgb(batch_palette, prompt_batch["mask"])  # type: ignore
         prompt_color_mask_norm = self.normalize(prompt_color_mask).to(self.device)
 
-        return prompt_batch, prompt_color_mask_norm
+        return prompt_batch, prompt_color_mask_norm  # type: ignore
 
     def create_palette(self, batch_size: int, train: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        palette = torch.Tensor(build_palette(self.num_classes - 1))
         if train:
             batch_palette = generate_random_rgb_palette(self.num_classes, batch_size, self.device)
         else:
+            palette = torch.Tensor(build_palette(self.num_classes - 1))
             batch_palette = torch.stack([palette for _ in range(batch_size)])
         palettes = []
         for palelle in batch_palette:
@@ -180,9 +237,8 @@ class PromptModel(LightningModule):
         color_mask = torch_apply_mask_rgb(batch_palette, batch["mask"])
         color_mask_norm = self.normalize(color_mask).to(self.device)
 
-        # choose prompt index
-        # TODO: Should pick once per batch item. Assumes batch size 1.
-        prompt_idx: int = torch.randint(0, self.conf.n_prompts, (), generator=self.g).item()  # type: ignore
+        # choose prompt index and prepare for processing
+        prompt_idx = torch.randint(0, len(self.prompt_params_list), (B,), generator=self.g)
         prompt_batch, prompt_masks = self.prepare_prompt(prompt_idx, batch_palette, train=True)
 
         out = self.model(
@@ -195,25 +251,21 @@ class PromptModel(LightningModule):
         pred_masks = self.process_pred_masks(out.pred_masks, batch_palette_norm)
 
         # self.ema[pi].mul_(self.conf.ema_alpha).add_(px.data, alpha=1 - self.conf.ema_alpha)
-        loss = out.loss
+        loss = self.loss_fn(out.pred_masks, color_mask_norm, batch["mask"] != 0)
         self.train_metrics.update(pred_masks, batch["mask"].squeeze(1).to(self.device))
 
-        self.log_dict({"train/loss": loss}, prog_bar=True, sync_dist=True, batch_size=len(batch["image"]))
-        # # Assume batch size 1 here
-        # self.train_batch_pred.append(
-        #     (
-        #         batch["image"].squeeze(0).detach(),
-        #         batch["mask"].squeeze(0).squeeze(0).detach(),
-        #         pred_masks[0].detach(),
-        #         prompt_batch["image"].squeeze(0).detach(),
-        #     )
-        # )
+        self.log_dict({"train/loss": loss}, prog_bar=True, batch_size=len(batch["image"]))
+        # Assume batch size 1 here
+        self.train_batch_pred.append(
+            (
+                batch["image"].squeeze(0).detach(),
+                batch["mask"].squeeze(0).squeeze(0).detach(),
+                pred_masks[0].detach(),
+                prompt_batch["image"].squeeze(0).detach(),
+            )
+        )
 
         return loss  # type: ignore
-
-    def on_train_epoch_end(self) -> None:
-        self.log_dict(self.train_metrics.compute(), sync_dist=True)
-        self.train_metrics.reset()
 
     def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int, dataloader_idx: int = 0):
         B, _, _, _ = batch["mask"].shape
@@ -223,10 +275,8 @@ class PromptModel(LightningModule):
         color_mask = torch_apply_mask_rgb(batch_palette, batch["mask"])
         color_mask_norm = self.normalize(color_mask).to(self.device)
 
-        # choose prompt index
-        # TODO: Should pick once per batch item. Assumes batch size 1.
-        prompt_idx: int = torch.randint(0, self.conf.n_prompts, (), generator=self.g).item()  # type: ignore
-        prompt_batch, prompt_masks = self.prepare_prompt(prompt_idx, batch_palette, train=False)
+        # prepare prompts for processing
+        prompt_batch, prompt_masks = self.prepare_prompt(batch["crop_idx"], batch_palette, train=False)
 
         out = self.model(
             pixel_values=batch["image"],
@@ -238,7 +288,9 @@ class PromptModel(LightningModule):
         pred_masks = self.process_pred_masks(out.pred_masks, batch_palette_norm)
 
         # self.ema[pi].mul_(self.conf.ema_alpha).add_(px.data, alpha=1 - self.conf.ema_alpha)
-        loss = out.loss
+        # loss = out.loss
+        loss = self.loss_fn(out.pred_masks, color_mask_norm, batch["mask"] != 0)
+
         self.val_metrics.update(pred_masks, batch["mask"].squeeze(1).to(self.device))
 
         self.log_dict({"val/loss": loss}, prog_bar=True, batch_size=len(batch["image"]))
@@ -248,23 +300,26 @@ class PromptModel(LightningModule):
                 batch["image"].squeeze(0).detach(),
                 batch["mask"].squeeze(0).squeeze(0).detach(),
                 pred_masks[0].detach(),
+                prompt_batch["image"].squeeze(0).detach(),
             )
         )
 
         return loss  # type: ignore
 
+    def on_train_epoch_end(self) -> None:
+        if self._should_plot_image():
+            grid = self._plot_examples(self.train_batch_pred)  # type: ignore
+            self.logger.experiment.add_image("train_images", grid, self.current_epoch)  # type: ignore
+
+        self.train_batch_pred = []
+        self.log_dict(self.train_metrics.compute(), sync_dist=True)
+        self.train_metrics.reset()
+
     def on_validation_epoch_end(self):
         if self._should_plot_image():
-            grid = self._plot_examples()  # type: ignore
+            grid = self._plot_examples(self.val_batch_pred)  # type: ignore
             self.logger.experiment.add_image("val_images", grid, self.current_epoch)  # type: ignore
-            # Resize to (B, C, viz_size, viz_size)
-            prompt_imgs = F.interpolate(
-                self.prompt_batch["image"],
-                size=(self.conf.viz_size, self.conf.viz_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-            grid = torchvision.utils.make_grid(prompt_imgs, nrow=1)
+            grid = torchvision.utils.make_grid(self.prompt_batch["image"], nrow=3)
             self.logger.experiment.add_image("prompt_images", grid, self.current_epoch)  # type: ignore
 
         self.val_batch_pred = []
@@ -278,14 +333,15 @@ class PromptModel(LightningModule):
             and self.logger.experiment is not None  # type: ignore
         )
 
-    def _plot_examples(self) -> torch.Tensor:
+    def _plot_examples(self, to_plot: list[list[torch.Tensor]]) -> torch.Tensor:
         with torch.no_grad():
-            batch_size = len(self.val_batch_pred)
+            batch_size = len(to_plot)
             num_images = min(batch_size, self.conf.num_viz_images)
 
-            x = torch.stack([b[0] for b in self.val_batch_pred[:num_images]])
-            target = torch.stack([b[1] for b in self.val_batch_pred[:num_images]])
-            pred = torch.stack([b[2] for b in self.val_batch_pred[:num_images]])
+            x = torch.stack([b[0] for b in to_plot[:num_images]])
+            target = torch.stack([b[1] for b in to_plot[:num_images]])
+            pred = torch.stack([b[2] for b in to_plot[:num_images]])
+            prompt_img = torch.stack([b[3] for b in to_plot[:num_images]])
 
             # Mark nodata as nodata if ignoring this class
             nodata = target == self.nodata_idx
@@ -294,12 +350,16 @@ class PromptModel(LightningModule):
             one_hot_target = self.one_hot(target.long(), num_classes=len(self.conf.classes)).bool()
 
             viz_image = self.make_image_visulizable(x)  # type: ignore
+            prompt_img = self.make_image_visulizable(prompt_img)
             target_images = plot_masks(viz_image, one_hot_target)
             pred_images = plot_masks(viz_image, one_hot_pred)
 
             # Resize to (B, C, viz_size, viz_size)
             viz_image = F.interpolate(
                 viz_image, size=(self.conf.viz_size, self.conf.viz_size), mode="bilinear", align_corners=False
+            )
+            prompt_img = F.interpolate(
+                prompt_img, size=(self.conf.viz_size, self.conf.viz_size), mode="bilinear", align_corners=False
             )
             target_images = F.interpolate(
                 target_images, size=(self.conf.viz_size, self.conf.viz_size), mode="bilinear", align_corners=False
@@ -314,11 +374,12 @@ class PromptModel(LightningModule):
                     viz_image,
                     target_images,
                     pred_images,
+                    prompt_img,
                 ),
                 dim=1,
-            )  # Shape: (B, 3, C, W, H)
-            interleaved = interleaved.view(-1, *target_images.shape[1:])  # Shape: (B * 3, C, W, H)
-            return torchvision.utils.make_grid(interleaved, nrow=3)
+            )  # Shape: (B, 4, C, W, H)
+            interleaved = interleaved.view(-1, *target_images.shape[1:])  # Shape: (B * 4, C, W, H)
+            return torchvision.utils.make_grid(interleaved, nrow=4)
 
     def configure_optimizers(self):
         global_batch_size = self.conf.batch_size * self.conf.world_size * self.conf.grad_accum_steps
