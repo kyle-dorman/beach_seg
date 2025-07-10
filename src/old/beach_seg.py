@@ -3,10 +3,8 @@ import shutil
 from pathlib import Path
 
 import click
-import geopandas as gpd
 import numpy as np
 import torch
-from shapely.geometry import LineString, MultiLineString
 from shapely.ops import transform
 from tqdm import tqdm
 from transformers import SegGptForImageSegmentation, SegGptImageProcessor
@@ -22,20 +20,13 @@ from src.util.geo_util import (
     merged_no_data_mask,
     rasterize_gdf,
     safe_assign_crop,
+    save_shapefile,
     save_tif,
 )
-from src.util.ml_util import generate_square_crops_along_line, load_model
+from src.util.ml_util import generate_square_crops_along_line, load_model, load_processor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
-
-
-def save_shapefile(line: LineString | MultiLineString, out_fp: Path, crs) -> None:
-    """
-    Save a LineString to a Shapefile with given CRS.
-    """
-    gdf = gpd.GeoDataFrame({"geometry": [line]}, crs=crs)
-    gdf.to_file(str(out_fp), driver="ESRI Shapefile")
 
 
 def run_seg_gpt_on_crops(
@@ -162,7 +153,8 @@ def main(
 
     # Load model
     logger.info("Loading model")
-    model, processor = load_model()
+    model = load_model("BAAI/seggpt-vit-large")
+    processor = load_processor("BAAI/seggpt-vit-large")
     logger.info("Done loading model")
 
     # ------------------------------------------------------------------

@@ -6,55 +6,19 @@ from typing import Any
 
 import cv2
 import numpy as np
-import rasterio
 import torch
 import tqdm
 from dotenv import find_dotenv, load_dotenv
 from lightning.pytorch import seed_everything
 from omegaconf import OmegaConf
-from PIL import Image, ImageColor
 
 from src.config import BeachSegConfig
 from src.data import BeachSegDataModule, create_dataset
 from src.model import PromptModel
-from src.util.img_util import CLASS_COLORS
+from src.util.img_util import overlay_prediction, write_mask_tif
 from src.util.util import setup_logger
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Utility: write a single-band prediction mask to GeoTIFF
-# ---------------------------------------------------------------------------
-def write_mask_tif(mask: np.ndarray, transform, crs, path: Path) -> None:
-    """
-    Save a 2-D uint8 mask as a single-band GeoTIFF.
-
-    Parameters
-    ----------
-    mask : np.ndarray
-        2-D array of class indices (H, W) - uint8/uint16/etc.
-    transform : affine.Affine
-        Rasterio transform mapping pixel → CRS coordinates.
-    crs : rasterio.crs.CRS
-        Coordinate reference system.
-    path : pathlib.Path
-        Destination file path.
-    """
-    height, width = mask.shape
-    with rasterio.open(
-        path,
-        "w",
-        driver="GTiff",
-        height=height,
-        width=width,
-        count=1,
-        dtype=mask.dtype,
-        transform=transform,
-        crs=crs,
-        compress="lzw",
-    ) as dst:
-        dst.write(mask, 1)
 
 
 @dataclass
@@ -89,11 +53,19 @@ def cpu_count() -> int:
 
 
 class Accumulator:
-    def __init__(self, out_shape: tuple[int, int], num_classes: int, save_dir: Path, out_transform: Any, crs: Any):
+    def __init__(
+        self,
+        out_shape: tuple[int, int],
+        save_dir: Path,
+        out_transform: Any,
+        crs: Any,
+        classes: tuple[str, ...],
+    ):
         self.out_shape = out_shape
-        self.num_classes = num_classes
+        self.num_classes = len(classes)
         self.out_transform = out_transform
         self.crs = crs
+        self.classes = classes
 
         self.img_dir = save_dir / "images"
         self.img_dir.mkdir(exist_ok=True)
@@ -127,20 +99,7 @@ class Accumulator:
 
         pred = np.argmax(self.current_pred_counter, axis=2)  # (H, W)
 
-        h, w, _ = self.current_img.shape
-        base_img = Image.fromarray(self.current_img)  # RGB
-
-        # Create a transparent RGBA layer for class overlays
-        overlay_rgba = np.zeros((h, w, 4), dtype=np.uint8)  # RGBA
-
-        alpha_val = int(255 * 0.3)  # 30 % opacity
-        for cls_idx, color_name in enumerate(CLASS_COLORS):
-            rgb = ImageColor.getrgb(color_name)  # convert "red" → (255, 0, 0)
-            mask = pred == cls_idx
-            overlay_rgba[mask] = (*rgb, alpha_val)
-
-        overlay_img = Image.fromarray(overlay_rgba, mode="RGBA")
-        blended = Image.alpha_composite(base_img.convert("RGBA"), overlay_img).convert("RGB")
+        blended = overlay_prediction(self.current_img, pred, self.classes)
 
         # Save
         save_path = self.img_dir / f"{self.current_date}.png"
@@ -271,7 +230,7 @@ def main():
     crops = train_dataset.crops
 
     with torch.no_grad():
-        with Accumulator(out_shape, num_classes, predict_dir, out_transform, crs) as acc:
+        with Accumulator(out_shape, predict_dir, out_transform, crs, conf.classes) as acc:
             for batch in tqdm.tqdm(iter(dataloader), total=1 + num_samples // conf.batch_size, desc="Model Inference"):
                 if batch["nodata"].all():
                     continue

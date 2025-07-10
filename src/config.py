@@ -6,9 +6,9 @@ from PIL.Image import Resampling
 
 CLASSES = (
     "nodata",
+    "sand",
     "water",
     "veg",
-    "sand",
 )
 
 
@@ -41,7 +41,7 @@ class BeachSegConfig:
     monitor_metric: str = "val/f1"
     monitor_mode: str = "max"
 
-    crop_size: int = 336
+    crop_size: int = 112
     inpt_size: int = 448
     # n_prompts: int = 1
     # max_pct_nodata: float = 0.5

@@ -3,11 +3,9 @@ import torch
 from shapely.geometry import LineString, MultiLineString, Point
 from transformers import SegGptForImageSegmentation, SegGptImageProcessor
 
-from src.config import BeachSegConfig
 
-
-def load_model(config: BeachSegConfig) -> SegGptForImageSegmentation:
-    model = SegGptForImageSegmentation.from_pretrained(config.checkpoint)
+def load_model(checkpoint: str) -> SegGptForImageSegmentation:
+    model = SegGptForImageSegmentation.from_pretrained(checkpoint)
     for p in model.parameters():  # freeze the backbone
         p.requires_grad_(False)
     model = torch.compile(model, mode="default").eval()
@@ -15,8 +13,8 @@ def load_model(config: BeachSegConfig) -> SegGptForImageSegmentation:
     return model  # type: ignore
 
 
-def load_processor(config: BeachSegConfig) -> SegGptImageProcessor:
-    return SegGptImageProcessor.from_pretrained(config.checkpoint)
+def load_processor(checkpoint: str) -> SegGptImageProcessor:
+    return SegGptImageProcessor.from_pretrained(checkpoint)
 
 
 def generate_square_crops_along_line(

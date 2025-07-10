@@ -29,7 +29,7 @@ from src.util.geo_util import (
     merged_no_data_mask,
     rasterize_gdf,
 )
-from src.util.ml_util import generate_square_crops_along_line, load_model, randomise_mask_rgb
+from src.util.ml_util import generate_square_crops_along_line, load_model, load_processor, randomise_mask_rgb
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -238,7 +238,8 @@ def main(base_dir, crop_size, epochs, lr, n_prompts, prompt_dropout, out_ckpt):
 
     # ── Train prompt tensors ────────────────────────────────────────────────
     logger.info(f"Training {n_prompts} prompt tensor(s) on {len(p_imgs)} crops")
-    model, processor = load_model()
+    model = load_model("BAAI/seggpt-vit-large")
+    processor = load_processor("BAAI/seggpt-vit-large")
     prompt_px, prompt_msk = train_learnable_prompt(
         model,
         processor,

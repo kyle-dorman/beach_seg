@@ -14,9 +14,9 @@ from torchmetrics.classification import (  # MulticlassPrecision,; MulticlassRec
 from torchvision.utils import draw_segmentation_masks
 
 from src.config import BeachSegConfig
-from src.data import BeachSegDataModule, build_palette, generate_random_rgb_palette, torch_apply_mask_rgb
+from src.data import BeachSegDataModule
 from src.util.img_util import CLASS_COLORS
-from src.util.ml_util import load_model
+from src.util.ml_util import build_palette, generate_random_rgb_palette, load_model, torch_apply_mask_rgb
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +24,13 @@ logger = logging.getLogger(__name__)
 def plot_masks(
     images: torch.Tensor,
     masks: torch.Tensor,
+    colors: list[str],
     alpha: float = 0.5,
 ) -> torch.Tensor:
     """Plot a sample from the dataset."""
     return torch.stack(
         [
-            draw_segmentation_masks(image=img, masks=mask, colors=CLASS_COLORS, alpha=alpha)  # type: ignore
+            draw_segmentation_masks(image=img, masks=mask, colors=colors, alpha=alpha)  # type: ignore
             for img, mask in zip(images, masks)
         ],
         dim=0,
@@ -73,7 +74,7 @@ class PromptModel(LightningModule):
         super().__init__()
         self.save_hyperparameters(conf)
 
-        self.model = load_model(conf)
+        self.model = load_model(conf.checkpoint)
         logger.info("✔️  SegGPT model loaded")
 
         logger.info("Creating metrics")
@@ -139,7 +140,7 @@ class PromptModel(LightningModule):
             pixel_values=batch_dict["image"],
             prompt_pixel_values=prompt_batch["image"],
             prompt_masks=prompt_masks,
-            embedding_type="semantic",
+            embedding_type="instance",
         )
         pred_masks = self.process_pred_masks(out.pred_masks, batch_palette_norm)
 
@@ -246,7 +247,7 @@ class PromptModel(LightningModule):
             labels=color_mask_norm,
             prompt_pixel_values=prompt_batch["image"],
             prompt_masks=prompt_masks,
-            embedding_type="semantic",
+            embedding_type="instance",
         )
         pred_masks = self.process_pred_masks(out.pred_masks, batch_palette_norm)
 
@@ -283,7 +284,7 @@ class PromptModel(LightningModule):
             labels=color_mask_norm,
             prompt_pixel_values=prompt_batch["image"],
             prompt_masks=prompt_masks,
-            embedding_type="semantic",
+            embedding_type="instance",
         )
         pred_masks = self.process_pred_masks(out.pred_masks, batch_palette_norm)
 
@@ -351,8 +352,8 @@ class PromptModel(LightningModule):
 
             viz_image = self.make_image_visulizable(x)  # type: ignore
             prompt_img = self.make_image_visulizable(prompt_img)
-            target_images = plot_masks(viz_image, one_hot_target)
-            pred_images = plot_masks(viz_image, one_hot_pred)
+            target_images = plot_masks(viz_image, one_hot_target, colors=[CLASS_COLORS[c] for c in self.conf.classes])
+            pred_images = plot_masks(viz_image, one_hot_pred, colors=[CLASS_COLORS[c] for c in self.conf.classes])
 
             # Resize to (B, C, viz_size, viz_size)
             viz_image = F.interpolate(

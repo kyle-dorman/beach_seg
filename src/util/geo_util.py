@@ -302,8 +302,7 @@ def crop_tif(
     crop_size: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     (xmin, ymin, xmax, ymax) = crop
-    # background is green for img
-    crop_img = padded_crop(img, xmin, ymin, xmax, ymax, crop_size, value=[0, 255, 0])
+    crop_img = padded_crop(img, xmin, ymin, xmax, ymax, crop_size)
     crop_nodata = padded_crop(nodata, xmin, ymin, xmax, ymax, crop_size, value=1)
 
     if label is not None:
@@ -395,7 +394,7 @@ def merge_tifs(
                 src_crs=src_crs,
                 dst_transform=out_transform,
                 dst_crs=crs,
-                resampling=Resampling.bilinear,
+                resampling=Resampling.cubic,
             )
             reproject(
                 source=yesdata,
@@ -447,22 +446,23 @@ def plot_crops(crops, color, ax):
         ax.add_patch(mRectangle((x1, y1), side, side, linewidth=1, edgecolor=color, facecolor="none", fill=False))
 
 
-def tif_image(data, nodata):
+def tif_image(data: np.ndarray, nodata: np.ndarray) -> np.ndarray:
     C = len(data)
     if C == 8:
         img = broad_band(data, nodata)
     else:
-        img = data[[3, 2, 1]]
-        for i in range(3):
-            min_val = img[i][~nodata].min()
-            img[i] = img[i].clip(min_val, min_val + 3000)
-            img[i] -= min_val
+        img = np.zeros((3, *data.shape[1:]), dtype=data.dtype)
+        img[0] = data[3]
+        img[1] = data[2]
+        img[2] = data[:2].mean(axis=0)
+        # img = data[[3, 2, 1]]
+        min_val = img[:, ~nodata].min()
+        img = img.clip(min_val, 3000 + min_val) - min_val
         # img = np.log10(1 + img)
+        img -= img[:, ~nodata].min()
         for i in range(3):
-            img[i] -= img[i].min()
             img[i] /= img[i].max()
             img[i][nodata] = 0
-        img[1][nodata] = 1.0
         img = img.transpose((1, 2, 0)).copy()
 
     img = np.array(img * 255, dtype=np.uint8)
@@ -569,3 +569,11 @@ def polygon_to_mask(image_size: tuple[int, int], polygon: Polygon) -> np.ndarray
     mask = np.array(img)
 
     return mask
+
+
+def save_shapefile(line: LineString | MultiLineString, out_fp: Path, crs) -> None:
+    """
+    Save a LineString to a Shapefile with given CRS.
+    """
+    gdf = gpd.GeoDataFrame({"geometry": [line]}, crs=crs)
+    gdf.to_file(str(out_fp), driver="ESRI Shapefile")
